@@ -1,0 +1,88 @@
+name: Generate Amul Invoice Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_filter:
+        description: "Date filter (Today, Yesterday, smart)"
+        required: false
+        default: "smart"
+
+# Prevent overlapping runs from invalidating each other's Amul OTP
+concurrency:
+  group: amul-invoice-report
+  cancel-in-progress: false
+
+jobs:
+  scrape-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Ensure Browser Available
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            playwright install chromium
+          fi
+
+      - name: Run Scraper & Deliver to Telegram
+        id: run_scraper
+        env:
+          AMUL_WD_CODE: ${{ secrets.AMUL_WD_CODE }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD || secrets.GMAIL_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATE_FILTER: ${{ github.event.inputs.date_filter || 'smart' }}
+          HEADLESS_MODE: "true"
+          PLAYWRIGHT_CHANNEL: "chrome"
+        run: |
+          python main.py
+
+      - name: Archive Screenshot on GitHub
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amul-invoice-${{ github.run_id }}
+          path: daily_invoice_report.png
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Only alert on workflow/setup failures; main.py sends its own Telegram error on scraper failure
+      - name: Alert Failure on Telegram
+        if: failure() && steps.run_scraper.outcome != 'failure'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN")
+          chat = os.getenv("TELEGRAM_CHAT_ID")
+          if token and chat:
+              payload = json.dumps({
+                  "chat_id": chat,
+                  "text": "❌ <b>GitHub Action Failed!</b>\nThe workflow failed before completing the report. Check GitHub Actions logs.",
+                  "parse_mode": "HTML",
+              }).encode("utf-8")
+              req = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=payload,
+                  headers={"Content-Type": "application/json"},
+              )
+              urllib.request.urlopen(req, timeout=10)
+          EOF
